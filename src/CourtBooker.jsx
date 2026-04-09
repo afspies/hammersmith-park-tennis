@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import InstallPrompt from './InstallPrompt.jsx'
 
 const CONFIG = {
@@ -6,7 +6,7 @@ const CONFIG = {
   firstHour: 7,
   lastHour: 21,
   slotMinutes: 60,
-  daysAhead: 3,
+  daysAhead: 14,
   maxNameLength: 20,
 }
 
@@ -27,26 +27,33 @@ function formatDate(dateStr) {
   return d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' })
 }
 
-function formatTime(hour) {
-  return `${hour.toString().padStart(2, '0')}:00`
+function formatTime(hour, half = 0) {
+  return `${hour.toString().padStart(2, '0')}:${half === 0 ? '00' : '30'}`
 }
 
-function isSlotPast(dateStr, hour) {
+function halfSlotEnd(hour, half) {
+  return half === 0 ? formatTime(hour, 1) : formatTime(hour + 1, 0)
+}
+
+function isSlotPast(dateStr, hour, half = 0) {
   const now = new Date()
   const slotEnd = new Date(dateStr + 'T00:00:00')
-  slotEnd.setHours(hour + 1)
+  slotEnd.setHours(hour)
+  slotEnd.setMinutes(half === 0 ? 30 : 60)
   return slotEnd <= now
 }
 
 export default function CourtBooker() {
   const [selectedDay, setSelectedDay] = useState(0)
-  const [bookings, setBookings] = useState({}) // keyed by "date:court:hour" → { id, name }
+  const [bookings, setBookings] = useState({}) // keyed by "date:court:hour:half" → { id, name }
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
   const [name, setName] = useState('')
   const [saving, setSaving] = useState(false)
   const [confirmCancel, setConfirmCancel] = useState(null)
   const [error, setError] = useState(null)
+  const tabsRef = useRef(null)
+  const dateInputRef = useRef(null)
 
   const dateStr = getDateStr(selectedDay)
 
@@ -60,7 +67,7 @@ export default function CourtBooker() {
       const data = await res.json()
       const map = {}
       for (const row of data) {
-        map[`${row.date}:${row.court}:${row.hour}`] = { id: row.id, name: row.name }
+        map[`${row.date}:${row.court}:${row.hour}:${row.half}`] = { id: row.id, name: row.name }
       }
       setBookings(map)
     } catch {
@@ -80,31 +87,35 @@ export default function CourtBooker() {
     return () => es.close()
   }, [loadBookings])
 
-  const getBooking = (ds, court, hour) => {
-    return bookings[`${ds}:${court}:${hour}`] || null
+  const getBooking = (ds, court, hour, half) => {
+    return bookings[`${ds}:${court}:${hour}:${half}`] || null
   }
 
   const handleBook = async () => {
     if (!name.trim() || !modal) return
     setSaving(true)
+    const halves = modal.half === 'full' ? [0, 1] : [modal.half]
     try {
-      const res = await fetch('/api/bookings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          court: modal.court,
-          date: modal.dateStr,
-          hour: modal.hour,
-          name: name.trim(),
-        }),
-      })
-      if (res.status === 409) {
-        alert('Slot just taken — please refresh and try another.')
-        setSaving(false)
-        loadBookings()
-        return
+      for (const h of halves) {
+        const res = await fetch('/api/bookings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            court: modal.court,
+            date: modal.dateStr,
+            hour: modal.hour,
+            half: h,
+            name: name.trim(),
+          }),
+        })
+        if (res.status === 409) {
+          alert('Slot just taken — please refresh and try another.')
+          setSaving(false)
+          loadBookings()
+          return
+        }
+        if (!res.ok) throw new Error()
       }
-      if (!res.ok) throw new Error()
     } catch {
       alert('Failed to save booking. Please try again.')
       setSaving(false)
@@ -117,8 +128,8 @@ export default function CourtBooker() {
     loadBookings()
   }
 
-  const handleCancel = async (ds, court, hour) => {
-    const booking = getBooking(ds, court, hour)
+  const handleCancel = async (ds, court, hour, half) => {
+    const booking = getBooking(ds, court, hour, half)
     if (!booking) return
     try {
       const res = await fetch(`/api/bookings/${booking.id}`, { method: 'DELETE' })
@@ -131,6 +142,27 @@ export default function CourtBooker() {
   }
 
   const nowHour = new Date().getHours()
+
+  useEffect(() => {
+    if (tabsRef.current && tabsRef.current.children[selectedDay]) {
+      tabsRef.current.children[selectedDay].scrollIntoView({
+        behavior: 'smooth',
+        inline: 'center',
+        block: 'nearest',
+      })
+    }
+  }, [selectedDay])
+
+  const handleDatePick = (e) => {
+    const picked = e.target.value
+    if (!picked) return
+    const today = getDateStr(0)
+    const diffMs = new Date(picked + 'T12:00:00') - new Date(today + 'T12:00:00')
+    const diffDays = Math.round(diffMs / 86400000)
+    if (diffDays >= 0 && diffDays < CONFIG.daysAhead) {
+      setSelectedDay(diffDays)
+    }
+  }
 
   return (
     <div style={styles.container}>
@@ -148,23 +180,42 @@ export default function CourtBooker() {
       </header>
 
       {/* Day tabs */}
-      <div style={styles.dayTabs}>
-        {Array.from({ length: CONFIG.daysAhead }, (_, i) => (
-          <button
-            key={i}
-            onClick={() => setSelectedDay(i)}
-            style={{
-              ...styles.dayTab,
-              ...(selectedDay === i ? styles.dayTabActive : {}),
-              ...(i === CONFIG.daysAhead - 1 ? { borderRight: '1.5px solid #c8c8b8' } : {}),
-              ...(selectedDay === i && i === CONFIG.daysAhead - 1
-                ? { borderRightColor: '#2d6a4f' }
-                : {}),
-            }}
-          >
-            {formatDate(getDateStr(i))}
-          </button>
-        ))}
+      <style>{`.day-tabs::-webkit-scrollbar { display: none }`}</style>
+      <div style={styles.dayTabsWrap}>
+        <div className="day-tabs" ref={tabsRef} style={styles.dayTabs}>
+          {Array.from({ length: CONFIG.daysAhead }, (_, i) => (
+            <button
+              key={i}
+              onClick={() => setSelectedDay(i)}
+              style={{
+                ...styles.dayTab,
+                ...(selectedDay === i ? styles.dayTabActive : {}),
+              }}
+            >
+              {formatDate(getDateStr(i))}
+            </button>
+          ))}
+        </div>
+        <button
+          style={styles.calendarBtn}
+          onClick={() => dateInputRef.current?.showPicker?.()}
+          title="Pick a date"
+        >
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <rect x="2" y="3" width="14" height="13" rx="2" stroke="#2d6a4f" strokeWidth="1.5" fill="none" />
+            <line x1="2" y1="7" x2="16" y2="7" stroke="#2d6a4f" strokeWidth="1.5" />
+            <line x1="6" y1="1.5" x2="6" y2="4.5" stroke="#2d6a4f" strokeWidth="1.5" strokeLinecap="round" />
+            <line x1="12" y1="1.5" x2="12" y2="4.5" stroke="#2d6a4f" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+        <input
+          type="date"
+          ref={dateInputRef}
+          style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', top: 0, left: 0 }}
+          min={getDateStr(0)}
+          max={getDateStr(CONFIG.daysAhead - 1)}
+          onChange={handleDatePick}
+        />
       </div>
 
       {error ? (
@@ -189,14 +240,14 @@ export default function CourtBooker() {
           {/* Slot rows */}
           {Array.from({ length: SLOTS_PER_DAY }, (_, i) => {
             const hour = CONFIG.firstHour + i
-            const past = isSlotPast(dateStr, hour)
+            const bothPast = isSlotPast(dateStr, hour, 1)
             const isCurrent = selectedDay === 0 && hour === nowHour
             return (
               <div
                 key={hour}
                 style={{
                   ...styles.gridRow,
-                  ...(past ? styles.gridRowPast : {}),
+                  ...(bothPast ? styles.gridRowPast : {}),
                   ...(isCurrent ? styles.gridRowCurrent : {}),
                 }}
               >
@@ -204,36 +255,85 @@ export default function CourtBooker() {
                   <span style={styles.timeText}>{formatTime(hour)}</span>
                 </div>
                 {CONFIG.courts.map((court) => {
-                  const booking = getBooking(dateStr, court, hour)
+                  const b0 = getBooking(dateStr, court, hour, 0)
+                  const b1 = getBooking(dateStr, court, hour, 1)
+                  const past0 = isSlotPast(dateStr, hour, 0)
+                  const past1 = isSlotPast(dateStr, hour, 1)
+                  const anyBooked = b0 || b1
+                  const allPast = past0 && past1
+
+                  if (allPast && !anyBooked) {
+                    return (
+                      <div key={court} style={styles.slotCell}>
+                        <div style={styles.slotPast}>—</div>
+                      </div>
+                    )
+                  }
+
+                  const showFullHour = !anyBooked && !allPast
+
                   return (
                     <div key={court} style={styles.slotCell}>
-                      {booking ? (
-                        <button
-                          style={styles.slotBooked}
-                          onClick={() =>
-                            !past &&
-                            setConfirmCancel({
-                              ds: dateStr,
-                              court,
-                              hour,
-                              name: booking.name,
-                            })
-                          }
-                          title={past ? booking.name : 'Tap to cancel'}
-                        >
-                          <span style={styles.bookedName}>{booking.name}</span>
-                          {!past && <span style={styles.cancelHint}>tap to cancel</span>}
-                        </button>
-                      ) : past ? (
-                        <div style={styles.slotPast}>—</div>
-                      ) : (
-                        <button
-                          style={styles.slotFree}
-                          onClick={() => setModal({ court, hour, dateStr })}
-                        >
-                          <span style={styles.freeText}>Book</span>
-                        </button>
-                      )}
+                      <div style={styles.slotContainer}>
+                        {/* Top: two half-slot buttons */}
+                        <div style={styles.halfSlotRow}>
+                          {[0, 1].map((half) => {
+                            const booking = half === 0 ? b0 : b1
+                            const past = half === 0 ? past0 : past1
+                            if (booking) {
+                              return (
+                                <button
+                                  key={half}
+                                  style={{
+                                    ...styles.halfSlotBooked,
+                                    ...(half === 0 ? styles.halfLeft : styles.halfRight),
+                                  }}
+                                  onClick={() =>
+                                    !past &&
+                                    setConfirmCancel({
+                                      ds: dateStr,
+                                      court,
+                                      hour,
+                                      half,
+                                      name: booking.name,
+                                    })
+                                  }
+                                  title={past ? booking.name : 'Tap to cancel'}
+                                >
+                                  <span style={styles.halfBookedName}>{booking.name}</span>
+                                  {!past && <span style={styles.cancelHint}>cancel</span>}
+                                </button>
+                              )
+                            }
+                            if (past) {
+                              return <div key={half} style={styles.halfSlotEmpty} />
+                            }
+                            return (
+                              <button
+                                key={half}
+                                style={{
+                                  ...styles.halfSlotFree,
+                                  ...(half === 0 ? styles.halfLeft : styles.halfRight),
+                                }}
+                                onClick={() => setModal({ court, hour, half, dateStr })}
+                              >
+                                <span style={styles.halfFreeText}>
+                                  {half === 0 ? ':00' : ':30'}
+                                </span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                        {/* Bottom: full-hour button */}
+                        {showFullHour && (
+                          <button
+                            style={styles.fullSlotFree}
+                            onClick={() => setModal({ court, hour, half: 'full', dateStr })}
+                          >
+                            <span style={styles.fullFreeText}>1 hr</span>
+                          </button>
+                        )}
+                      </div>
                     </div>
                   )
                 })}
@@ -246,10 +346,27 @@ export default function CourtBooker() {
       <InstallPrompt />
 
       <footer style={styles.footer}>
-        <p>
-          This is a voluntary system for the community.
-          <br />
-          No enforcement — just coordination.
+        <p>This is a voluntary system for the community.</p>
+        <p style={styles.footerLinks}>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault()
+              window.location.href = ['ma','ilto:','alex','@','afspies','.com'].join('')
+            }}
+            style={styles.footerLink}
+          >
+            Contact
+          </a>
+          {' · '}
+          <a
+            href="https://github.com/afspies/hammersmith-park-tennis"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={styles.footerLink}
+          >
+            GitHub
+          </a>
         </p>
       </footer>
 
@@ -259,8 +376,9 @@ export default function CourtBooker() {
           <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
             <h2 style={styles.modalTitle}>Book a slot</h2>
             <p style={styles.modalInfo}>
-              {modal.court} · {formatDate(modal.dateStr)} · {formatTime(modal.hour)}–
-              {formatTime(modal.hour + 1)}
+              {modal.court} · {formatDate(modal.dateStr)} · {modal.half === 'full'
+                ? `${formatTime(modal.hour)}–${formatTime(modal.hour + 1)}`
+                : `${formatTime(modal.hour, modal.half)}–${halfSlotEnd(modal.hour, modal.half)}`}
             </p>
             <input
               style={styles.input}
@@ -297,7 +415,7 @@ export default function CourtBooker() {
             <h2 style={styles.modalTitle}>Cancel booking?</h2>
             <p style={styles.modalInfo}>
               {confirmCancel.court} · {formatDate(confirmCancel.ds)} ·{' '}
-              {formatTime(confirmCancel.hour)}–{formatTime(confirmCancel.hour + 1)}
+              {formatTime(confirmCancel.hour, confirmCancel.half)}–{halfSlotEnd(confirmCancel.hour, confirmCancel.half)}
             </p>
             <p style={{ ...styles.modalInfo, fontWeight: 600 }}>
               Booked by: {confirmCancel.name}
@@ -309,7 +427,7 @@ export default function CourtBooker() {
               <button
                 style={{ ...styles.btnConfirm, background: '#c1121f' }}
                 onClick={() =>
-                  handleCancel(confirmCancel.ds, confirmCancel.court, confirmCancel.hour)
+                  handleCancel(confirmCancel.ds, confirmCancel.court, confirmCancel.hour, confirmCancel.half)
                 }
               >
                 Cancel booking
@@ -353,17 +471,30 @@ const styles = {
     margin: '6px 0 0',
     lineHeight: 1.3,
   },
-  dayTabs: {
+  dayTabsWrap: {
+    position: 'relative',
     display: 'flex',
-    gap: 0,
+    alignItems: 'center',
+    gap: 8,
     padding: '0 20px',
     marginTop: 16,
   },
-  dayTab: {
+  dayTabs: {
+    display: 'flex',
+    gap: 6,
+    overflowX: 'auto',
+    scrollSnapType: 'x mandatory',
+    scrollbarWidth: 'none',
+    WebkitOverflowScrolling: 'touch',
     flex: 1,
-    padding: '10px 0',
+    paddingBottom: 2,
+  },
+  dayTab: {
+    minWidth: 90,
+    flexShrink: 0,
+    padding: '8px 12px',
     border: '1.5px solid #c8c8b8',
-    borderRight: 'none',
+    borderRadius: 8,
     background: '#fff',
     fontSize: 13,
     fontWeight: 500,
@@ -371,12 +502,28 @@ const styles = {
     cursor: 'pointer',
     fontFamily: 'inherit',
     transition: 'all 0.15s',
+    scrollSnapAlign: 'start',
+    whiteSpace: 'nowrap',
   },
   dayTabActive: {
     background: '#2d6a4f',
     color: '#fff',
     borderColor: '#2d6a4f',
     fontWeight: 700,
+  },
+  calendarBtn: {
+    flexShrink: 0,
+    width: 36,
+    height: 36,
+    border: '1.5px solid #c8c8b8',
+    borderRadius: 8,
+    background: '#fff',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontFamily: 'inherit',
+    transition: 'all 0.15s',
   },
   errorWrap: {
     display: 'flex',
@@ -464,52 +611,6 @@ const styles = {
   slotCell: {
     minHeight: 44,
   },
-  slotFree: {
-    width: '100%',
-    height: 44,
-    border: '1.5px dashed #b7c9b7',
-    borderRadius: 8,
-    background: '#f0f5f0',
-    cursor: 'pointer',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontFamily: 'inherit',
-    transition: 'all 0.15s',
-  },
-  freeText: {
-    fontSize: 13,
-    color: '#2d6a4f',
-    fontWeight: 600,
-  },
-  slotBooked: {
-    width: '100%',
-    height: 44,
-    border: '1.5px solid #2d6a4f',
-    borderRadius: 8,
-    background: '#2d6a4f',
-    cursor: 'pointer',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontFamily: 'inherit',
-    padding: '2px 6px',
-  },
-  bookedName: {
-    fontSize: 13,
-    color: '#fff',
-    fontWeight: 700,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    maxWidth: '100%',
-  },
-  cancelHint: {
-    fontSize: 9,
-    color: 'rgba(255,255,255,0.55)',
-    marginTop: 1,
-  },
   slotPast: {
     width: '100%',
     height: 44,
@@ -519,12 +620,102 @@ const styles = {
     color: '#bbb',
     fontSize: 14,
   },
+  slotContainer: {
+    border: '1.5px solid #c8d8c8',
+    borderRadius: 8,
+    overflow: 'hidden',
+    background: '#f0f5f0',
+    height: 48,
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  halfSlotRow: {
+    display: 'flex',
+    flex: 1,
+    minHeight: 0,
+  },
+  halfLeft: {
+    borderRight: '1px solid #c8d8c8',
+  },
+  halfRight: {},
+  halfSlotFree: {
+    flex: 1,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontFamily: 'inherit',
+    transition: 'background 0.15s',
+    padding: '4px 0',
+  },
+  halfFreeText: {
+    fontSize: 11,
+    color: '#2d6a4f',
+    fontWeight: 600,
+  },
+  halfSlotBooked: {
+    flex: 1,
+    border: 'none',
+    background: '#2d6a4f',
+    cursor: 'pointer',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontFamily: 'inherit',
+    padding: '2px 4px',
+  },
+  halfBookedName: {
+    fontSize: 10,
+    color: '#fff',
+    fontWeight: 700,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    maxWidth: '100%',
+  },
+  cancelHint: {
+    fontSize: 7,
+    color: 'rgba(255,255,255,0.55)',
+    marginTop: 0,
+  },
+  halfSlotEmpty: {
+    flex: 1,
+  },
+  fullSlotFree: {
+    width: '100%',
+    border: 'none',
+    borderTop: '1px solid #c8d8c8',
+    background: 'transparent',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontFamily: 'inherit',
+    transition: 'background 0.15s',
+    padding: '3px 0',
+  },
+  fullFreeText: {
+    fontSize: 10,
+    color: '#2d6a4f',
+    fontWeight: 600,
+  },
   footer: {
     padding: '24px 20px 32px',
     textAlign: 'center',
     fontSize: 12,
     color: '#999',
     lineHeight: 1.5,
+  },
+  footerLinks: {
+    marginTop: 6,
+  },
+  footerLink: {
+    color: '#2d6a4f',
+    textDecoration: 'none',
+    fontWeight: 600,
   },
   overlay: {
     position: 'fixed',
