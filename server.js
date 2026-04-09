@@ -15,17 +15,43 @@ mkdirSync(dataDir, { recursive: true })
 
 const db = new Database(join(dataDir, 'db.sqlite'))
 db.pragma('journal_mode = WAL')
-db.exec(`
-  CREATE TABLE IF NOT EXISTS bookings (
-    id TEXT PRIMARY KEY,
-    court TEXT NOT NULL,
-    date TEXT NOT NULL,
-    hour INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    UNIQUE (court, date, hour)
-  )
-`)
+
+// Migrate or create bookings table with half-slot support
+const columns = db.prepare("PRAGMA table_info(bookings)").all()
+if (columns.length > 0 && !columns.some(c => c.name === 'half')) {
+  // Existing table without half column — recreate with new schema
+  db.exec(`
+    BEGIN;
+    ALTER TABLE bookings RENAME TO bookings_old;
+    CREATE TABLE bookings (
+      id TEXT PRIMARY KEY,
+      court TEXT NOT NULL,
+      date TEXT NOT NULL,
+      hour INTEGER NOT NULL,
+      half INTEGER NOT NULL DEFAULT 0,
+      name TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE (court, date, hour, half)
+    );
+    INSERT INTO bookings (id, court, date, hour, half, name, created_at)
+      SELECT id, court, date, hour, 0, name, created_at FROM bookings_old;
+    DROP TABLE bookings_old;
+    COMMIT;
+  `)
+} else {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS bookings (
+      id TEXT PRIMARY KEY,
+      court TEXT NOT NULL,
+      date TEXT NOT NULL,
+      hour INTEGER NOT NULL,
+      half INTEGER NOT NULL DEFAULT 0,
+      name TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE (court, date, hour, half)
+    )
+  `)
+}
 
 // SSE clients
 const clients = new Set()
@@ -46,21 +72,24 @@ app.get('/api/bookings', (req, res) => {
   const dateList = dates.split(',')
   const placeholders = dateList.map(() => '?').join(',')
   const rows = db.prepare(
-    `SELECT id, court, date, hour, name FROM bookings WHERE date IN (${placeholders})`
+    `SELECT id, court, date, hour, half, name FROM bookings WHERE date IN (${placeholders})`
   ).all(...dateList)
   res.json(rows)
 })
 
 app.post('/api/bookings', (req, res) => {
-  const { court, date, hour, name } = req.body
-  if (!court || !date || hour == null || !name) {
+  const { court, date, hour, half, name } = req.body
+  if (!court || !date || hour == null || half == null || !name) {
     return res.status(400).json({ error: 'Missing fields' })
+  }
+  if (half !== 0 && half !== 1) {
+    return res.status(400).json({ error: 'half must be 0 or 1' })
   }
   const id = randomUUID()
   try {
     db.prepare(
-      'INSERT INTO bookings (id, court, date, hour, name) VALUES (?, ?, ?, ?, ?)'
-    ).run(id, court, date, hour, name.trim())
+      'INSERT INTO bookings (id, court, date, hour, half, name) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(id, court, date, hour, half, name.trim())
     broadcast()
     res.status(201).json({ id })
   } catch (err) {
